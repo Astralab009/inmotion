@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -15,7 +16,7 @@ from dotenv import load_dotenv
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/137.0.0.0 Safari/537.36"
 )
 REQUEST_TIMEOUT = 12
 MAX_ITEMS_PER_SOURCE = 30
@@ -24,6 +25,8 @@ HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Cache-Control": "max-age=0",
+    "Connection": "keep-alive",
 }
 
 NewsItem = Dict[str, Any]
@@ -36,8 +39,21 @@ logging.basicConfig(
 logger = logging.getLogger("news_crawler")
 
 
-def fetch_url(url: str, *, params: Optional[dict] = None) -> requests.Response:
-    response = requests.get(url, headers=HEADERS, params=params, timeout=REQUEST_TIMEOUT)
+def fetch_url(
+    url: str,
+    *,
+    params: Optional[dict] = None,
+    headers: Optional[dict] = None,
+    session: Optional[requests.Session] = None,
+) -> requests.Response:
+    request_headers = {**HEADERS, **(headers or {})}
+    client = session or requests
+    response = client.get(
+        url,
+        headers=request_headers,
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
     response.raise_for_status()
     return response
 
@@ -84,6 +100,31 @@ def clean_text(value: Any) -> str:
         return ""
     text = BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def parse_json_or_jsonp(text: str) -> Any:
+    payload = text.strip().lstrip("\ufeff")
+    assignment_match = re.match(r"^(?:var\s+)?[\w$]+\s*=\s*(.*?);?$", payload, flags=re.S)
+    if assignment_match:
+        payload = assignment_match.group(1).strip()
+
+    jsonp_match = re.match(r"^[\w$.]+\((.*)\)\s*;?$", payload, flags=re.S)
+    if jsonp_match:
+        payload = jsonp_match.group(1).strip()
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        object_start = payload.find("{")
+        object_end = payload.rfind("}")
+        if object_start != -1 and object_end != -1 and object_end > object_start:
+            return json.loads(payload[object_start : object_end + 1])
+
+        array_start = payload.find("[")
+        array_end = payload.rfind("]")
+        if array_start != -1 and array_end != -1 and array_end > array_start:
+            return json.loads(payload[array_start : array_end + 1])
+        raise
 
 
 def normalize_url(url: str, base_url: str) -> str:
@@ -228,68 +269,177 @@ def crawl_wallstreetcn() -> List[NewsItem]:
 
 
 def crawl_sina() -> List[NewsItem]:
-    """Fetch Sina Finance RSS first, then fall back to finance page HTML."""
+    """Fetch Sina Finance from RSS/API endpoints without scraping blocked pages."""
+    sina_headers = {
+        "Referer": "https://finance.sina.com.cn/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.8,*/*;q=0.7",
+    }
     rss_candidates = [
-        "https://rss.sina.com.cn/finance/roll.xml",
         "https://rss.sina.com.cn/finance/focus.xml",
-        "https://rss.sina.com.cn/finance/stock/usstock.xml",
+        "http://rss.sina.com.cn/finance/focus.xml",
+        "https://rss.sina.com.cn/finance/roll.xml",
+        "http://rss.sina.com.cn/finance/roll.xml",
+        "https://rss.sina.com.cn/roll/finance/hot_roll.xml",
+        "http://rss.sina.com.cn/roll/finance/hot_roll.xml",
     ]
     for rss_url in rss_candidates:
         try:
-            items = parse_rss(rss_url, "sina")
+            response = fetch_url(rss_url, headers=sina_headers)
+            soup = BeautifulSoup(response.content, "html.parser")
+            items = []
+            for entry in soup.find_all("item")[:MAX_ITEMS_PER_SOURCE]:
+                title_tag = entry.find("title")
+                link_tag = entry.find("link")
+                description_tag = entry.find("description")
+                pub_date_tag = entry.find("pubDate") or entry.find("pubdate")
+                item = normalize_item(
+                    title=title_tag.text if title_tag else "",
+                    summary=description_tag.text if description_tag else "",
+                    content=description_tag.text if description_tag else "",
+                    source="sina",
+                    url=clean_text(link_tag.text if link_tag else ""),
+                    published_at=pub_date_tag.text if pub_date_tag else None,
+                    base_url=rss_url,
+                )
+                if item:
+                    items.append(item)
             if items:
                 return dedupe_items(items)
         except Exception as exc:
             logger.warning("sina RSS attempt failed for %s: %s", rss_url, exc)
 
-    html_url = "https://finance.sina.com.cn/stock/usstock/c/"
-    response = fetch_url(html_url)
-    response.encoding = response.apparent_encoding or response.encoding
-    soup = BeautifulSoup(response.text, "html.parser")
-    items = []
-    for link in soup.select("a[href]")[:300]:
-        href = link.get("href", "")
-        title = clean_text(link.get_text(" ", strip=True))
-        if len(title) < 6 or "finance.sina.com.cn" not in href:
-            continue
-        item = normalize_item(
-            title=title,
-            summary="",
-            content=title,
-            source="sina",
-            url=href,
-            published_at=None,
-            base_url=html_url,
-        )
-        if item:
-            items.append(item)
-    return dedupe_items(items)[:MAX_ITEMS_PER_SOURCE]
+    api_attempts = [
+        (
+            "https://feed.mix.sina.com.cn/api/roll/get",
+            {"pageid": 153, "lid": 2509, "k": "", "num": 50, "page": 1},
+        ),
+        (
+            "https://feed.mix.sina.com.cn/api/roll/get",
+            {"pageid": 153, "lid": 2510, "k": "", "num": 50, "page": 1},
+        ),
+        (
+            "https://feed.mix.sina.com.cn/api/roll/get",
+            {"pageid": 153, "lid": 1686, "k": "", "num": 50, "page": 1},
+        ),
+    ]
+
+    session = requests.Session()
+    try:
+        fetch_url("https://finance.sina.com.cn/", headers=sina_headers, session=session)
+    except Exception as exc:
+        logger.warning("sina session warm-up failed: %s", exc)
+
+    for api_url, params in api_attempts:
+        try:
+            response = fetch_url(api_url, params=params, headers=sina_headers, session=session)
+            payload = parse_json_or_jsonp(response.text)
+            result = payload.get("result", payload) if isinstance(payload, dict) else {}
+            records = result.get("data") or payload.get("data") or []
+            if isinstance(records, dict):
+                records = records.get("list") or records.get("items") or []
+            if not isinstance(records, list):
+                records = []
+
+            items = []
+            for record in records[:MAX_ITEMS_PER_SOURCE]:
+                title = record.get("title") or record.get("stitle")
+                url = record.get("url") or record.get("wapurl") or record.get("link")
+                summary = record.get("intro") or record.get("summary") or ""
+                published_at = (
+                    record.get("ctime")
+                    or record.get("time")
+                    or record.get("create_time")
+                    or record.get("date")
+                )
+                item = normalize_item(
+                    title=title,
+                    summary=summary,
+                    content=summary or title,
+                    source="sina",
+                    url=url,
+                    published_at=published_at,
+                    base_url="https://finance.sina.com.cn/",
+                )
+                if item:
+                    items.append(item)
+            if items:
+                return dedupe_items(items)
+        except Exception as exc:
+            logger.warning("sina API attempt failed for %s: %s", api_url, exc)
+
+    return []
 
 
 def crawl_eastmoney() -> List[NewsItem]:
-    """Fetch Eastmoney 7x24 flash news from common JSON endpoints."""
-    attempts = [
-        (
-            "https://zhibo.eastmoney.com/api/qt/timeline",
-            {"limit": MAX_ITEMS_PER_SOURCE},
-        ),
+    """Fetch Eastmoney flash news from JSON/JSONP endpoints, with HTML fallback."""
+    eastmoney_headers = {
+        "Referer": "https://www.eastmoney.com/",
+        "Accept": "application/json,text/javascript,text/html,application/xhtml+xml,*/*;q=0.8",
+    }
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    session = requests.Session()
+    try:
+        fetch_url("https://www.eastmoney.com/", headers=eastmoney_headers, session=session)
+        fetch_url("https://kuaixun.eastmoney.com/", headers=eastmoney_headers, session=session)
+    except Exception as exc:
+        logger.warning("eastmoney session warm-up failed: %s", exc)
+
+    api_attempts = [
         (
             "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html",
             {},
         ),
+        (
+            "https://newsapi.eastmoney.com/kuaixun/v1/getlist_102_ajaxResult_50_1_.html",
+            {"_": now_ms},
+        ),
+        (
+            "https://np-listapi.eastmoney.com/comm/web/getNewsByColumns",
+            {
+                "client": "web",
+                "biz": "web_news_col",
+                "column": "724",
+                "order": 1,
+                "needInteractData": 0,
+                "page_index": 1,
+                "page_size": 50,
+                "req_trace": now_ms,
+            },
+        ),
+        (
+            "https://zhibo.eastmoney.com/api/qt/timeline",
+            {"limit": MAX_ITEMS_PER_SOURCE, "_": now_ms},
+        )
     ]
 
-    for url, params in attempts:
+    def extract_eastmoney_records(payload: Any) -> List[dict]:
+        if isinstance(payload, list):
+            return [record for record in payload if isinstance(record, dict)]
+        if not isinstance(payload, dict):
+            return []
+
+        candidates = [
+            payload.get("data"),
+            payload.get("Data"),
+            payload.get("LivesList"),
+            payload.get("news"),
+            payload,
+        ]
+        for candidate in candidates:
+            if isinstance(candidate, list):
+                return [record for record in candidate if isinstance(record, dict)]
+            if isinstance(candidate, dict):
+                for key in ("list", "List", "items", "Items", "news", "LivesList", "data"):
+                    value = candidate.get(key)
+                    if isinstance(value, list):
+                        return [record for record in value if isinstance(record, dict)]
+        return []
+
+    for url, params in api_attempts:
         try:
-            text = fetch_url(url, params=params).text.strip()
-            text = re.sub(r"^[^(]*\((.*)\)\s*;?$", r"\1", text, flags=re.S)
-            payload = requests.models.complexjson.loads(text)
-            data = payload.get("data") or payload.get("Data") or payload
-            records = data.get("list") if isinstance(data, dict) else data
-            if isinstance(records, dict):
-                records = records.get("items") or records.get("List") or []
-            if not isinstance(records, list):
-                records = []
+            response = fetch_url(url, params=params, headers=eastmoney_headers, session=session)
+            payload = parse_json_or_jsonp(response.text)
+            records = extract_eastmoney_records(payload)
 
             items = []
             for record in records[:MAX_ITEMS_PER_SOURCE]:
@@ -298,13 +448,17 @@ def crawl_eastmoney() -> List[NewsItem]:
                     or record.get("Title")
                     or record.get("content")
                     or record.get("Content")
+                    or record.get("digest")
+                    or record.get("Digest")
                 )
                 url_value = (
                     record.get("url")
                     or record.get("Url")
                     or record.get("link")
                     or record.get("Link")
-                    or f"https://zhibo.eastmoney.com/news/{record.get('id') or record.get('newsid', '')}"
+                    or record.get("newsUrl")
+                    or record.get("NewsUrl")
+                    or f"https://kuaixun.eastmoney.com/{record.get('id') or record.get('newsid') or ''}"
                 )
                 item = normalize_item(
                     title=title,
@@ -317,7 +471,7 @@ def crawl_eastmoney() -> List[NewsItem]:
                     or record.get("time")
                     or record.get("Time")
                     or record.get("sort_time"),
-                    base_url="https://zhibo.eastmoney.com",
+                    base_url="https://kuaixun.eastmoney.com/",
                 )
                 if item:
                     items.append(item)
@@ -325,6 +479,39 @@ def crawl_eastmoney() -> List[NewsItem]:
                 return dedupe_items(items)
         except Exception as exc:
             logger.warning("eastmoney API attempt failed for %s: %s", url, exc)
+
+    html_attempts = [
+        "https://wap.eastmoney.com/kuaixun/index.html",
+        "https://kuaixun.eastmoney.com/",
+    ]
+    for html_url in html_attempts:
+        try:
+            response = fetch_url(html_url, headers=eastmoney_headers, session=session)
+            response.encoding = response.apparent_encoding or response.encoding
+            soup = BeautifulSoup(response.text, "html.parser")
+            items = []
+            for link in soup.select("a[href]")[:300]:
+                title = clean_text(link.get_text(" ", strip=True))
+                href = link.get("href", "")
+                if len(title) < 6:
+                    continue
+                if "eastmoney.com" not in href and not href.startswith(("/", "./")):
+                    continue
+                item = normalize_item(
+                    title=title,
+                    summary="",
+                    content=title,
+                    source="eastmoney",
+                    url=href,
+                    published_at=None,
+                    base_url=html_url,
+                )
+                if item:
+                    items.append(item)
+            if items:
+                return dedupe_items(items)[:MAX_ITEMS_PER_SOURCE]
+        except Exception as exc:
+            logger.warning("eastmoney HTML attempt failed for %s: %s", html_url, exc)
 
     return []
 
